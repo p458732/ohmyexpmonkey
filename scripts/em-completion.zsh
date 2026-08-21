@@ -247,9 +247,16 @@ _em() {
         '--message[message]:message:'
       ;;
     config)
+      # Mirrors cmd_config's branches on the Python side; keep in sync.
       if (( CURRENT == 2 )); then
-        local -a keys; keys=('user:set username')
+        local -a keys
+        keys=('user:set username'
+              'ai_commit:generate commit messages from the staged diff'
+              'commit_msg_cmd:command that generates them')
         _describe -t keys 'config key' keys
+      elif (( CURRENT == 3 )) && [[ $words[2] == ai_commit ]]; then
+        local -a vals; vals=('on' 'off')
+        _describe -t values 'ai_commit' vals
       fi
       ;;
     hooks)

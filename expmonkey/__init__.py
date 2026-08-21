@@ -61,6 +61,10 @@ def ce(s):
     return f"{_C_EXP}{s}{_C_RESET}" if _USE_COLOR else s
 
 
+def dim(s):
+    return f"{_C_DIM}{s}{_C_RESET}" if _USE_COLOR else s
+
+
 def cb(branch):
     """Color a branch name, splitting on '/' for series/exp distinction."""
     if "/" in branch:
@@ -84,6 +88,24 @@ def run(args, cwd=None, check=True, capture=True):
         err = (res.stderr or "").strip() if capture else ""
         die(f"command failed: {' '.join(args)}\n{err}")
     return (res.stdout or "").strip() if capture else ""
+
+
+def _bounded_output(args, cwd, limit):
+    """Run `args`, reading at most `limit` characters of its stdout.
+
+    Reading all of `git diff --cached` only to slice it costs real memory on an
+    ML repo -- the pre-commit hook admits files up to LARGE_FILE_LIMIT_MIB, and
+    every byte past the limit is discarded anyway. Closing the pipe early hands
+    the writer EPIPE, so git stops generating the rest instead of finishing.
+    """
+    proc = subprocess.Popen(args, cwd=cwd, stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, text=True)
+    try:
+        return proc.stdout.read(limit)
+    finally:
+        proc.stdout.close()
+        proc.kill()
+        proc.wait()
 
 
 def today_str():
@@ -261,28 +283,68 @@ def _validate_user(name):
     return name
 
 
-def write_user_config(basedir, name):
-    """Persist `user=<name>` into .em/config, replacing any existing line."""
-    cfg = os.path.join(basedir, EM_DIR, "config")
+def _config_path(basedir):
+    return os.path.join(basedir, EM_DIR, "config")
+
+
+# Keys an EM_<KEY> environment variable may override for a single command.
+# Listed explicitly rather than derived from the key name: em already uses
+# EM_BRANCH and EM_USER for unrelated things, so a blanket rule would let a
+# future config key silently hijack them, and an override nothing names in the
+# source cannot be grepped for when something misbehaves.
+_ENV_OVERRIDABLE = {"ai_commit", "commit_msg_cmd"}
+
+# Anything plainly negative turns a switch off. Deliberately generous on this
+# side: `ai_commit` decides whether the staged diff leaves the machine, so a
+# value em fails to recognise must not leave it switched on.
+_OFF_VALUES = {"off", "false", "0", "no", "n"}
+
+
+def _config_get(basedir, key):
+    """Value of `key` in .em/config, or None. For the keys in
+    _ENV_OVERRIDABLE, EM_<KEY> takes precedence over the file."""
+    if key in _ENV_OVERRIDABLE:
+        env = os.environ.get("EM_" + key.upper())
+        if env:
+            return env
+    cfg = _config_path(basedir)
+    if os.path.isfile(cfg):
+        for line in open(cfg):
+            line = line.strip()
+            if line.startswith(key + "="):
+                return line.split("=", 1)[1]
+    return None
+
+
+def _config_set(basedir, key, value):
+    """Persist `key=value` into .em/config, replacing any existing line."""
+    cfg = _config_path(basedir)
     lines = []
     if os.path.isfile(cfg):
-        lines = [l for l in open(cfg).read().splitlines() if not l.startswith("user=")]
-    lines.append(f"user={name}")
+        lines = [l for l in open(cfg).read().splitlines()
+                 if not l.startswith(key + "=")]
+    lines.append(f"{key}={value}")
     with open(cfg, "w") as f:
         f.write("\n".join(lines) + "\n")
 
 
+def _config_off(basedir, key):
+    """True if `key` is set to something that plainly means off."""
+    value = _config_get(basedir, key)
+    return value is not None and value.strip().lower() in _OFF_VALUES
+
+
 def get_user():
+    # Read here rather than through _config_get so it still answers outside an
+    # em project, where find_basedir() below would die. "user" is therefore not
+    # in _ENV_OVERRIDABLE -- this is the only place EM_USER is honoured.
     v = os.environ.get("EM_USER")
     if v:
         return _validate_user(v)
     basedir = find_basedir()
-    cfg = os.path.join(basedir, EM_DIR, "config")
-    if os.path.isfile(cfg):
-        for line in open(cfg):
-            line = line.strip()
-            if line.startswith("user="):
-                return _validate_user(line.split("=", 1)[1])
+    configured = _config_get(basedir, "user")
+    if configured:
+        return _validate_user(configured)
     try:
         login = os.getlogin()
     except OSError:
@@ -546,7 +608,7 @@ def _settle_user(basedir):
     name = _detect_user()
     problem = user_name_problem(name)
     if not problem:
-        write_user_config(basedir, name)
+        _config_set(basedir, "user", name)
         return name
     info(f"cannot use {problem}")
     # Non-interactive (CI, scripts, pipes): report and move on rather than block.
@@ -565,7 +627,7 @@ def _settle_user(basedir):
         if problem:
             info(f"cannot use {problem}")
             continue
-        write_user_config(basedir, entered)
+        _config_set(basedir, "user", entered)
         return entered
     return None
 
@@ -755,7 +817,7 @@ def cmd_series_rm(args):
     if nested:
         note = (f"  {len(nested)} experiment(s) removed locally; "
                 f"pushed copies stay on the remote")
-        print(f"{_C_DIM}{note}{_C_RESET}" if _USE_COLOR else note)
+        print(dim(note))
 
 
 def _exp_full_name(user, day, name):
@@ -1070,10 +1132,81 @@ def cmd_rm(args):
     # clearing disk space is reversible via `em cp <branch>`.
     print(f"removed locally: {cb(branch or label)}")
     if branch:
-        print(f"  {_C_DIM}pushed copies stay on the remote; "
-              f"`em cp {branch}` brings it back{_C_RESET}" if _USE_COLOR
-              else f"  pushed copies stay on the remote; "
-                   f"`em cp {branch}` brings it back")
+        print(dim(f"  pushed copies stay on the remote; "
+                  f"`em cp {branch}` brings it back"))
+
+
+# The whole payload goes in on stdin -- `claude -p` reads a piped prompt, so
+# the instructions need not be argv and every generator is a plain command
+# string. Experiment commits are not feat:/fix: work, so conventional-commit
+# prefixes are ruled out: what matters three months later is which knob moved.
+_COMMIT_MSG_PROMPT = (
+    "Below is the staged diff of one step of a machine-learning experiment. "
+    "Write its git commit message.\n"
+    "First line: at most 72 characters, imperative, naming what actually "
+    "changed (hyperparameters, model, data, metrics). Never 'update files'.\n"
+    "Add a short bullet body only if the first line cannot carry it.\n"
+    "No conventional-commit prefix, no surrounding quotes, no code fence. "
+    "Output the message and nothing else."
+)
+
+# Reuses the Claude Code login the user already has, and costs no dependency:
+# shelling out is what em does with git too. Override it per project with
+# `em config commit_msg_cmd <cmd>`, or per command with EM_COMMIT_MSG_CMD.
+_DEFAULT_MSG_CMD = "claude -p"
+_DEFAULT_MSG_BINARY = "claude"
+
+# ML diffs get large. Past this the tail tells a message nothing it can use,
+# and the call only gets slower.
+_DIFF_CHAR_LIMIT = 60000
+_MSG_CMD_TIMEOUT = 30
+
+
+def _ai_commit_message(path):
+    """A commit message generated from the staged diff, or None.
+
+    Returns None for every reason there might not be one -- generation turned
+    off, generator missing, non-zero exit, timeout, empty output. `em push`
+    exists to get work onto the remote; the message is a nicety, and must never
+    be the reason a push does not happen.
+
+    Reads the index, so it has to run after `git add -A`, not before.
+    """
+    basedir = find_basedir(path)
+    if _config_off(basedir, "ai_commit"):
+        return None
+    cmd = _config_get(basedir, "commit_msg_cmd") or _DEFAULT_MSG_CMD
+    # Only the built-in default is probed: its binary name is known, whereas a
+    # configured command line may legitimately start with anything a shell
+    # accepts. Probing first matters because assembling the diff below is the
+    # expensive part, and without `claude` installed it would all be discarded
+    # on every push -- which, with generation on by default, is the common case.
+    if cmd == _DEFAULT_MSG_CMD and shutil.which(_DEFAULT_MSG_BINARY) is None:
+        info(f"`{_DEFAULT_MSG_BINARY}` not found, using wip; silence this with "
+             f"`em config ai_commit off`")
+        return None
+    # --name-status, not --stat: --stat is itself a full content diff of every
+    # staged file, and once the patch below is truncated all a message needs
+    # from it is which files took part.
+    names = run(["git", "diff", "--cached", "--name-status"], cwd=path, check=False)
+    diff = _bounded_output(["git", "diff", "--cached"], path, _DIFF_CHAR_LIMIT)
+    if len(diff) == _DIFF_CHAR_LIMIT:
+        diff += "\n... [diff truncated by em]"
+    try:
+        res = subprocess.run(
+            cmd, shell=True, cwd=path,
+            input=f"{_COMMIT_MSG_PROMPT}\n\n{names}\n\n{diff}\n",
+            capture_output=True, text=True, timeout=_MSG_CMD_TIMEOUT,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        info(f"commit message generator unavailable "
+             f"({exc.__class__.__name__}); falling back to wip")
+        return None
+    msg = (res.stdout or "").strip()
+    if res.returncode != 0 or not msg:
+        info("commit message generator produced nothing; falling back to wip")
+        return None
+    return msg
 
 
 def _cm_push(path, message, label):
@@ -1083,8 +1216,10 @@ def _cm_push(path, message, label):
         ["git", "diff", "--cached", "--quiet"], cwd=path
     ).returncode == 0
     if not clean:
-        msg = message or f"wip {today_str()}"
-        run(["git", "commit", "-m", msg], cwd=path)
+        # -m means the user wrote it themselves, so it always wins.
+        if message is None:
+            message = _ai_commit_message(path)
+        run(["git", "commit", "-m", message or f"wip {today_str()}"], cwd=path)
         info(f"{label}: committed")
     else:
         info(f"{label}: nothing to commit")
@@ -1126,10 +1261,25 @@ def cmd_config(args):
     if args.key == "user" and args.value:
         # Reject here, not at the next em command: the mistake is visible now.
         _validate_user(args.value)
-        write_user_config(basedir, args.value)
+        _config_set(basedir, "user", args.value)
         print(f"set user={args.value}")
+    elif args.key == "ai_commit" and args.value in ("on", "off"):
+        _config_set(basedir, "ai_commit", args.value)
+        print(f"set ai_commit={args.value}")
+        print(dim("  em push asks "
+                  f"`{_config_get(basedir, 'commit_msg_cmd') or _DEFAULT_MSG_CMD}` "
+                  "for its commit message" if args.value == "on"
+                  else "  em push goes back to committing `wip <date>`"))
+    elif args.key == "commit_msg_cmd" and args.value:
+        # Persisted, not env-only: pointing at a local model is how a user keeps
+        # the staged diff on their machine, and that must survive a new shell.
+        _config_set(basedir, "commit_msg_cmd", args.value)
+        print(f"set commit_msg_cmd={args.value}")
+        print(dim("  em pipes the prompt and staged diff to it on stdin"))
     else:
-        die("usage: em config user <name>")
+        die("usage: em config user <name>\n"
+            "       em config ai_commit on|off\n"
+            "       em config commit_msg_cmd <command>")
 
 
 def build_parser():
@@ -1173,7 +1323,9 @@ def build_parser():
     sp.set_defaults(func=cmd_rm)
 
     sp = sub.add_parser("push", help="commit and push current experiment")
-    sp.add_argument("-m", "--message", default=None)
+    sp.add_argument("-m", "--message", default=None,
+                    help="commit message; without it em generates one from the "
+                         "staged diff (see `em config ai_commit`)")
     sp.set_defaults(func=cmd_push)
 
     sp = sub.add_parser("hooks", help="manage git hooks for this em project")
@@ -1181,7 +1333,8 @@ def build_parser():
     hi = hsub.add_parser("install", help=f"install pre-commit hook (rejects files >{LARGE_FILE_LIMIT_MIB}MiB)")
     hi.set_defaults(func=cmd_hooks_install)
 
-    sp = sub.add_parser("config", help="set local config (user)")
+    sp = sub.add_parser("config",
+                        help="set local config (user, ai_commit, commit_msg_cmd)")
     sp.add_argument("key")
     sp.add_argument("value", nargs="?")
     sp.set_defaults(func=cmd_config)
