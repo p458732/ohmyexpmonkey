@@ -42,7 +42,7 @@ The tool is a thin layer over `git worktree`. The mental model is:
 ## Command set
 
 Nine top-level commands: `init`, `series` (new/ls/rm), `cp`, `ls`, `cd`, `rm`,
-`push`, `hooks install`, `config`. Five were deliberately retired — don't
+`push`, `hooks install`, `config` (`user`, `ai_commit`). Five were deliberately retired — don't
 reintroduce them without a reason:
 
 - `new` / `cm` were aliases (`em cp master <n>`, `em push -m`).
@@ -52,6 +52,41 @@ reintroduce them without a reason:
   experiment into a series folder is a plain `mv`, healed on the next command.
 - `empty` was the only orphan-branch path and went unused.
 - `co` folded into `em cp`'s single-argument form (see `_adopt_branch`).
+
+## Commit messages are generated, but never at the cost of a push
+
+`em push` without `-m` calls `_ai_commit_message()`, which pipes the prompt,
+`git diff --cached --name-status` and a bounded read of the staged patch into
+the command from `commit_msg_cmd` (default `claude -p`). It returns None for
+every reason there might not be a message and `_cm_push` then commits
+`wip <date>` — see its docstring; that fallback is the feature, so keep it
+total when editing.
+
+What the code does not say:
+
+- **On unless switched off.** `_config_off` treats `off/false/0/no/n` as off and
+  anything else as on. Generous on the off side on purpose: this switch decides
+  whether the staged diff leaves the machine, so a value em fails to recognise
+  must not leave it running.
+- **Both escapes must keep working** — `em config ai_commit off` and a local
+  model via `commit_msg_cmd`. The latter is a config key rather than env-only
+  precisely so it survives a new shell; an escape hatch you must re-export in
+  every terminal is not one.
+- **`_ENV_OVERRIDABLE` is a list, not a rule.** Only those keys read `EM_<KEY>`.
+  A blanket rule would let a future key named `branch` hijack `EM_BRANCH`, which
+  already means something else, and would leave `EM_AI_COMMIT` appearing nowhere
+  in the source.
+- **No test may reach a real API.** `tests/integration.sh` unsets
+  `EM_COMMIT_MSG_CMD` at script level and pins it to `false` inside `run_em`
+  with `${VAR-false}` — the `-` matters, since a test passing an empty value is
+  how it reaches the config path instead.
+- **`_auto_cm_if_dirty` (`em cp`) and `_backup_before_remove` (`em rm`) are
+  excluded.** They are safety snapshots, not curated work; a generator that
+  hangs must never sit between the user and a backup-before-delete. `_cm_push`
+  is the only commit site that generates, and it has exactly one caller.
+
+Shelling out is why this costs no dependency — no new import was needed, so the
+stdlib-only rule below still holds.
 
 ## Shared ignore list
 
@@ -109,6 +144,12 @@ Per-kind candidate coloring is done at the top of the completion file via top-le
 
 ## Username resolution
 
+`.em/config` is a flat `key=value` file read through `_config_get(basedir,
+key)` / `_config_set` / `_config_off`. Only keys in `_ENV_OVERRIDABLE` honour an
+`EM_<KEY>` environment override; `user` is not one of them, because `get_user()`
+reads `EM_USER` itself before `find_basedir()` so it still answers outside a
+project.
+
 `get_user()` tries in order: env `EM_USER` → `.em/config` `user=` line →
 `os.getlogin()` / `$USER` / `$LOGNAME`. Every result passes through
 `_validate_user`, which rejects a name containing `.` or equal to `series`.
@@ -116,7 +157,7 @@ The rule itself lives in `user_name_problem()`, which *returns* the problem
 instead of dying, so `em init` can re-prompt where other callers just fail.
 
 `cmd_init` calls `_settle_user()` at the end: it resolves a name, pins it into
-`.em/config` via `write_user_config()`, and when the name is unusable either
+`.em/config` via `_config_set()`, and when the name is unusable either
 prompts (tty) or reports and moves on (not a tty — CI must never block). It
 never raises: by that point the project is fully built, so an unusable name is
 the *next step*, not a failed init. `cmd_config` validates up front so a typo is

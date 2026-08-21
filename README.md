@@ -225,9 +225,11 @@ em cp zh.260516.cool_idea      # 别人推的实验，原样取回
 | `em ls [-a]` | 列实验：默认列当前文件夹；`-a` 列全部（所有系列 + 根目录） |
 | `em cd <name>` | cd 到指定系列或实验（系列内可省略系列前缀） |
 | `em rm <name> [-y]` | 删除实验：**先自动备份**（有未提交改动 / 未推的 commit 就 commit + push），再删 worktree + 目录 + **本地**分支。远端不受影响，之后用 `em cp <分支名>` 就能取回。**备份推不上去（分支分歧 / 远端不可达）会直接中止，不删任何东西** |
-| `em push [-m msg]` | `git add -A` + commit（msg 省略则 `wip <date>`）+ push 当前实验 |
+| `em push [-m msg]` | `git add -A` + commit + push 当前实验。msg 省略时由 `claude -p` 读 staged diff 生成（见四之四），失败或关闭时退回 `wip <date>` |
 | `em hooks install` | （重新）安装 pre-commit 钩子 + 刷新忽略清单。升级 em 后跑一次，老项目就能拿到新规则 |
 | `em config user <name>` | 写 `.em/config` 里的 `user=` |
+| `em config ai_commit on\|off` | 开关 `em push` 的 commit message 自动生成，默认开启 |
+| `em config commit_msg_cmd <cmd>` | 换掉生成命令（默认 `claude -p`），写进 `.em/config` |
 
 ### 子命令在 git 层做了什么
 
@@ -360,6 +362,56 @@ git add -f figure.png
 ```
 
 `em hooks install` 会重写这个块（升级 em 后跑一次就拿到新规则），**块外的内容一个字都不动**。
+
+---
+
+## 四之四、自动生成 commit message（默认开启）
+
+`em push` 不给 `-m` 时，把 staged diff 交给 `claude -p` 生成 commit message：
+
+```bash
+# 改了 lr、scheduler、batch size 之后
+em push
+# → "Switch to cosine schedule, raise lr to 3e-4 and batch size to 64"
+```
+
+对照组是从前的 `wip 20260821` —— 三个月后回头看，那行字什么也没告诉你。
+
+**三条规则：**
+
+1. **`-m` 永远优先。** 你自己写了就用你的，不会去问模型。
+2. **失败绝不挡 push。** 没装 `claude`、非 0 退出、空输出、超过 30 秒 —— 任何一种都退回
+   `wip <date>` 照常推。`em push` 的职责是把工作推上远端，message 只是锦上添花。
+3. **不用 conventional commits。** 实验的 commit 不是 `feat:` / `fix:`，要的是「哪个旋钮动了」。
+
+### diff 会离开本机 —— 两个出口
+
+生成靠的是把 staged diff 交给 `claude`，所以你的训练代码会离开这台机器。
+仓库涉密、或在不该外传的环境里跑，用下面任一个：
+
+```bash
+# 出口一：整个关掉
+em config ai_commit off      # 写进 .em/config，退回 wip <date>
+EM_AI_COMMIT=off em push     # 只关这一次
+
+# 出口二：换成本机模型，diff 不出网
+em config commit_msg_cmd 'ollama run qwen2.5-coder'
+```
+
+`ai_commit` 认得 `off` / `false` / `0` / `no`，**认不出的值一律当关闭** ——
+这个开关管的是代码出不出网，写错一个字不该让它继续开着。
+
+`commit_msg_cmd` 是**写进 `.em/config` 的**，不是只能靠环境变量：
+指向本机模型的设置必须能活过换一个终端，否则这个出口等于没有。
+临时改用别的：`EM_COMMIT_MSG_CMD='...' em push`。
+
+### 生成命令拿到什么
+
+em 会把 prompt + `git diff --cached --name-status` + staged patch 从 **stdin** 灌进去，
+读 stdout 当 message。所以任何「读 stdin、写 stdout」的命令都能接。
+
+patch 超过 60000 字符就截断（ML 仓库的 diff 很大，尾巴对 message 没有帮助，只会拖慢调用；
+em 也不会把整份读进内存 —— 读满就让 git 停下）。
 
 ---
 

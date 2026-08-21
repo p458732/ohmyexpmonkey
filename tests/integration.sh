@@ -6,7 +6,13 @@ EM_SRC="${EM_SRC:-$(cd "$(dirname "$0")/.." && pwd)}"
 LAB="${LAB:-/tmp/em-integration}"
 PASS=0; FAIL=0
 
+# A maintainer who has EM_COMMIT_MSG_CMD exported (pointing at a real model)
+# would otherwise run the whole suite through it. Clearing it here still lets
+# 3t's per-call `EM_COMMIT_MSG_CMD=... run_em` prefixes win, since an assignment
+# in front of a function call beats a script-level unset.
+unset EM_COMMIT_MSG_CMD EM_AI_COMMIT
 run_em() { EM_USER=viktor EM_ALLOW_LOCAL_URL=1 PYTHONPATH="$EM_SRC" \
+           EM_COMMIT_MSG_CMD="${EM_COMMIT_MSG_CMD-false}" \
            python3 -c "import expmonkey; expmonkey.main()" "$@"; }
 G="git -c user.email=a@b -c user.name=a"
 
@@ -343,6 +349,76 @@ cd "$V" && run_em series rm backedup -y >/dev/null 2>&1
 [ -d "$V/series.backedup" ] && bad "series not removed" || ok "series removed"
 check "nested experiment's work reached the remote" \
       "$(git -C "$LAB/remote.git" show "$N:n.txt" 2>/dev/null)" "nested result"
+
+echo "=== 3t. em push message generation: on by default, pluggable, never blocks ==="
+cd "$V" || exit 1
+run_em cp dev_gaze aimsg >/dev/null 2>&1
+A="viktor.$TODAY6.aimsg"
+WIP="wip $(date +%Y%m%d)"
+subject() { git -C "$V/$A" log -1 --format=%s; }
+cd "$V/$A" || exit 1
+
+# On unless turned off: an unset ai_commit still generates.
+echo one > a.txt
+EM_COMMIT_MSG_CMD="printf 'lr 1e-4 -> 3e-4, cosine schedule'" \
+  run_em push >/dev/null 2>&1
+check "generation is on by default" "$(subject)" "lr 1e-4 -> 3e-4, cosine schedule"
+
+(cd "$V" && run_em config ai_commit off) >/dev/null 2>&1
+echo two > b.txt
+EM_COMMIT_MSG_CMD="printf 'should not run'" run_em push >/dev/null 2>&1
+check "ai_commit off disables it" "$(subject)" "$WIP"
+
+(cd "$V" && run_em config ai_commit on) >/dev/null 2>&1
+echo two-again > b2.txt
+EM_COMMIT_MSG_CMD="printf 'back on'" run_em push >/dev/null 2>&1
+check "ai_commit on re-enables it" "$(subject)" "back on"
+
+# The generator sees the staged diff on stdin.
+echo three > carrot.txt
+EM_COMMIT_MSG_CMD="grep -q carrot.txt && printf 'saw the diff'" \
+  run_em push >/dev/null 2>&1
+check "the diff is piped to the generator" "$(subject)" "saw the diff"
+
+# A failing generator must never come between you and your remote.
+echo four > d.txt
+EM_COMMIT_MSG_CMD=false run_em push >/dev/null 2>&1
+check "a failing generator falls back to wip" "$(subject)" "$WIP"
+check "and the push still happened" \
+      "$(git -C "$LAB/remote.git" log -1 --format=%s "$A")" "$WIP"
+
+echo five > e.txt
+EM_COMMIT_MSG_CMD=true run_em push >/dev/null 2>&1
+check "empty output falls back too" "$(subject)" "$WIP"
+
+# -m means "I wrote it myself" and always wins.
+echo six > f.txt
+EM_COMMIT_MSG_CMD="printf 'generated'" run_em push -m handwritten >/dev/null 2>&1
+check "-m overrides the generator" "$(subject)" "handwritten"
+
+# EM_AI_COMMIT is the documented one-shot escape from "the diff leaves the
+# machine", and this switch fails closed: anything plainly negative is off.
+echo seven > g.txt
+EM_AI_COMMIT=off EM_COMMIT_MSG_CMD="printf 'should not run'" \
+  run_em push >/dev/null 2>&1
+check "EM_AI_COMMIT=off disables it for one command" "$(subject)" "$WIP"
+
+echo eight > h.txt
+EM_AI_COMMIT=0 EM_COMMIT_MSG_CMD="printf 'should not run'" \
+  run_em push >/dev/null 2>&1
+check "an unrecognised off value still disables it" "$(subject)" "$WIP"
+
+# The generator is a config key, not env-only: pointing at a local model has to
+# survive a new shell, or the privacy escape hatch is not one.
+(cd "$V" && run_em config commit_msg_cmd "printf 'from config'") >/dev/null 2>&1
+check "commit_msg_cmd is persisted" \
+      "$(grep -c '^commit_msg_cmd=' "$V/.em/config")" "1"
+echo nine > i.txt
+EM_COMMIT_MSG_CMD= run_em push >/dev/null 2>&1   # empty: no env override
+check "the configured generator is used with no env var set" \
+      "$(subject)" "from config"
+
+cd "$V" && run_em rm aimsg -y >/dev/null 2>&1
 
 echo "=== 4. ls / cd / rm find the experiment ==="
 cd "$V" || exit 1   # 3g left us inside a series folder that 3i then deleted
